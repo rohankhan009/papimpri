@@ -42,3 +42,11 @@ online-device filter, and "one device sends 80 SMS" (configurable cap).
 - Number leads upload/paste se aate hain; replace lines positional map hoti hain (invalid numbers filter hone ke baad bhi order sahi).
 - Mismatch count par warning. Auto-reconnect (localStorage) add hua; Disconnect clears it.
 - Verified via Node test: positional mapping PASS.
+
+## Update (2026-06) — Speed + Multi-Firebase
+- MULTI-FIREBASE: Setup me ab kai Firebase add ho sakte hain (label+URL+key each). Sab projects ke devices merge hokar ek list me. localStorage key: lb_fb_conns (legacy single migrated).
+- Device object carries {connId, connLabel, base, authKey, key:connId+id} so sends route to the correct project.
+- PARALLEL BLAST: har device ek saath (concurrently) apni queue line-by-line bhejta hai. Pool size = "Parallel devices" (0=all). Node test: 3 devices = 3x faster, routing correct, payload {from,to,message,isSended:false} intact.
+- Speed modes: Turbo (no ack, delay default 400ms) [default] vs Safe (wait isSended, poll 700ms/timeout 15s).
+- Spread mode default (round-robin across all devices) for max speed; "one device fully" still available.
+- Progress bar + live rate (/s) + elapsed. Logout all = clears all connections at once.
