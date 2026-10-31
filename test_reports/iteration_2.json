@@ -1,0 +1,51 @@
+{
+  "summary": "Iteration 2 covered the new features (login lockout, editable branding via /api/settings, scheduled blasts with the 15s scheduler and cancel, cyberpunk theme with ClickFX and footer, Emergent branding removal) plus a regression of login, turbo blast and auto-logout. Backend: 26/26 pytest pass (16 regression + 10 new). Frontend: every requested flow works at 1920 and 390 widths. Bugs found: /tasks/current can return the wrong task after scheduling, and the client panel does not refresh while scheduled tasks are pending. There are also some minor validation and UX issues.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/tasks/current", "issue": "When nothing is running it returns the most recently CREATED task (sorted by created_at), and that includes scheduled and cancelled tasks. Repro: schedule blast A at +55s, schedule blast B at +1h, cancel B, let A complete. /tasks/current then returns B (stopped, sent 0), not A (completed, sent 3), so after a reload the UI shows 0 sent and no progress. A new future scheduled task also becomes 'current' over a completed one."},
+      {"endpoint": "POST /api/tasks/{id}/stop", "issue": "No status guard. Calling it on an already completed or failed task (once RUNNING has been cleaned up after 10s) overwrites the status to 'stopped'. Only scheduled/pending/running tasks should be stoppable."},
+      {"endpoint": "POST /api/tasks (scheduled_at)", "issue": "A past time, or one within 30s, is silently run immediately instead of being rejected or flagged. A user who picks a past time by mistake triggers an instant blast."},
+      {"endpoint": "execute_task / scheduler", "issue": "The task is not claimed atomically (find_one, then a later update_one to running). An immediate POST /tasks and the scheduler picking up a due task can both pass the 'no running task' check, so two tasks run at once for one client. Use find_one_and_update({status:'scheduled'} -> 'running') as an atomic claim."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "ClientPanel scheduled-list", "issue": "No polling while scheduled tasks exist. When the scheduler starts a task, the list still shows it, the task/progress state is never refreshed and the running pill never appears until a manual reload. Fix: poll /tasks and /tasks/current every ~5s while scheduled.length>0, and pick up the running task.", "selector": "[data-testid='scheduled-list']", "priority": "MEDIUM"},
+      {"component": "ClientPanel scheduled row time", "issue": "Shows the raw UTC ISO string (String(scheduled_at).replace('T',' ').slice(0,16)), not local time. An IST user who schedules 20:00 will see 14:30. Use new Date(t.scheduled_at).toLocaleString().", "selector": "[data-testid^='scheduled-']", "priority": "MEDIUM"},
+      {"component": "ClientPanel start-blast", "issue": "With schedule-toggle checked but schedule-at empty, the button reads 'Schedule Blast' but sends an immediate blast (scheduled_at omitted). It should block with an error when the time is empty or in the past.", "selector": "[data-testid='start-blast']", "priority": "MEDIUM"},
+      {"component": "ClientPanel scheduled row", "issue": "Renders t.leads_count, but the backend never returns that field (leads are excluded from /api/tasks), so the slot is always empty.", "selector": ".lb-sub-sm", "priority": "LOW"}
+    ],
+    "integration_issues": [
+      {"flow": "Scheduled blast -> reload", "issue": "Because of the /tasks/current ordering bug, the counters and progress show the cancelled or scheduled task (0 sent), not the scheduled blast that completed.", "affected_selectors": ["[data-testid='sent-count']", "[data-testid='progress']"]}
+    ],
+    "design_issues": [
+      {"screen": "Client panel topbar @390px", "issues": ["The logo 'Lead Blast' wraps onto 2 lines, and the pills (user/firebase/online/offline) wrap into multiple rows that are clipped or overlap at the top of the sticky bar. Consider hiding some pills or making the pill row horizontally scrollable on mobile."]},
+      {"screen": "Global footer", "issues": ["The fixed footer pill overlays the bottom of the content, e.g. the centre of the Start Blast button and the log. It has pointer-events:none, so clicks are not blocked, but adding padding-bottom (~40px) to .lb-panel would avoid the visual overlap."]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_iter2_features.py", "/app/backend/tests/test_leadblast_api.py", "/app/test_reports/pytest/pytest_results_iter2.xml"],
+  "action_items": [
+    "Fix GET /api/tasks/current: prefer the running task, else the most recently finished non-scheduled task (sort by finished_at/updated_at, exclude status 'scheduled' and cancelled-before-run tasks)",
+    "ClientPanel: poll /tasks and /tasks/current while scheduled tasks exist so a scheduled blast transitions to running/progress in the UI without a reload",
+    "Display scheduled_at in local time",
+    "Validate the schedule: block when the toggle is on and the time is empty or past (frontend), and return 400 for a past scheduled_at (backend) instead of running immediately",
+    "Guard stop_task so only scheduled/pending/running tasks can be stopped",
+    "Atomic claim in execute_task (find_one_and_update) to prevent double runs",
+    "Remove or return leads_count for scheduled rows",
+    "Mobile topbar layout polish; add bottom padding for the fixed footer"
+  ],
+  "critical_code_review_comments": [
+    "server.py login lockout is correct: 4x 401 with 'N try bache', 5th 429 'locked', a correct password while locked returns 429, and a successful login resets the counter. Unknown users are not rate limited (acceptable).",
+    "api.js 401 interceptor: once location.hash is 'reauth' it is never cleared, so later 401s in the same tab won't reload to the login screen.",
+    "PUT /api/settings has no length limits on the branding fields. Consider max_length in SettingsIn.",
+    "The posthog script in public/index.html still references ap.emergent.sh (not visible to users; no Emergent badge rendered)."
+  ],
+  "updated_files": ["/app/backend/tests/test_iter2_features.py (new)", "/app/backend/tests/test_leadblast_api.py (second firebase now uses a localhost alias because duplicate-URL 409 was added)"],
+  "success_rate": {"backend": "100% (26/26)", "frontend": "~90% (all requested flows pass; scheduled-task UI refresh/display bugs)"},
+  "seed_data_creation": "No permanent seed data. TEST_ clients created and deleted. Branding changed to TEST values and then restored to the defaults. raju is left with 0 firebases and no running or scheduled task. A pre-existing 'qa_client_1' client exists (not created by this run).",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Run pytest with -n 0 (pytest.ini enables xdist, and parallel runs break the shared mock __count assertions). Start the mock with `python /app/tests/mockfb.py &`. The scheduled test takes ~60s. Retest /tasks/current ordering after scheduling plus cancelling, and the scheduled-list auto-refresh in the UI.",
+  "rca of the issue": "/tasks/current falls back to find_one(sort created_at desc) over all user tasks, so scheduled and cancelled tasks created after the executed one shadow it. ClientPanel only polls while task.status==='running', and task is only loaded on mount, so scheduler-started tasks are never picked up without a reload."
+}

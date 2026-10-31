@@ -122,8 +122,9 @@ class TestFirebases:
 
     def test_add_multi_devices_remove_all_isolation(self, clients):
         a, b = clients
-        for i in range(2):
-            r = requests.post(f"{API}/firebases", json={"label": f"TEST_fb{i}", "url": MOCK, "key": ""}, headers=hdr(a["token"]))
+        # duplicate URL per client now returns 409 -> use two URL aliases of the same mock
+        for i, url in enumerate([MOCK, "http://localhost:9999"]):
+            r = requests.post(f"{API}/firebases", json={"label": f"TEST_fb{i}", "url": url, "key": ""}, headers=hdr(a["token"]))
             assert r.status_code == 200, r.text
             assert "_id" not in r.json()
         fbs = requests.get(f"{API}/firebases", headers=hdr(a["token"])).json()

@@ -235,6 +235,15 @@ input[type="datetime-local"].lb-input { color-scheme: dark; }
 .lb-schedrow { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--bg2); border: 1px solid var(--border2); border-radius: 10px; font-size: 12px; }
 .lb-schedrow .lb-mono { flex: 1; color: var(--lilac); }
 .lb-sub-sm { font-size: 10px; color: var(--sub); }
+
+/* mobile polish */
+@media (max-width: 640px) {
+  .lb-topbar { height: auto; min-height: 56px; flex-wrap: wrap; padding: 8px 12px; row-gap: 6px; }
+  .lb-pills { order: 3; width: 100%; margin: 0; overflow-x: auto; flex-wrap: nowrap; }
+  .lb-logo { font-size: 15px; }
+  .lb-poff { display: none; }
+}
+.lb-grid { padding-bottom: 54px; }
 .lb-tbtn {
   height: 32px; padding: 0 12px; background: var(--bg3); border: 1px solid var(--border);
   border-radius: 8px; color: var(--sub); font-family: 'Exo 2', sans-serif; font-size: 11px;

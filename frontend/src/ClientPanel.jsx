@@ -97,6 +97,14 @@ export default function ClientPanel({ brand, onLogout }) {
     return () => clearInterval(iv);
   }, [task?.status, loadTask, loadFirebases, loadDevices]);
 
+  // poll while scheduled tasks exist so a scheduled blast turns into a running one without reload
+  useEffect(() => {
+    if (scheduled.length === 0) return;
+    const iv = setInterval(() => { loadScheduled(); loadTask(); }, 5000);
+    return () => clearInterval(iv);
+  }, [scheduled.length, loadScheduled, loadTask]);
+
+
   const onlineDevices = useMemo(() => devicesData.devices.filter((d) => d.online), [devicesData]);
   const offlineCount = devicesData.devices.length - onlineDevices.length;
 
@@ -194,7 +202,11 @@ export default function ClientPanel({ brand, onLogout }) {
       delayMs: Number(delayMs) || 0, maxParallel: Number(maxParallel) || 0, autoLogout,
       deviceKeys: deviceSel === "selected" ? [...selectedIds] : null,
     };
-    if (scheduleOn && scheduleAt) payload.scheduled_at = new Date(scheduleAt).toISOString();
+    if (scheduleOn) {
+      if (!scheduleAt) return setStartErr("Schedule time choose karein");
+      if (new Date(scheduleAt).getTime() <= Date.now() + 30000) return setStartErr("Schedule time future me hona chahiye");
+      payload.scheduled_at = new Date(scheduleAt).toISOString();
+    }
     try {
       const { data } = await api.post("/tasks", payload);
       if (data.scheduled) {
@@ -414,8 +426,8 @@ export default function ClientPanel({ brand, onLogout }) {
               <div className="lb-fl">Scheduled blasts</div>
               {scheduled.map((t) => (
                 <div key={t.id} className="lb-schedrow" data-testid={`scheduled-${t.id}`}>
-                  <span className="lb-mono">🕒 {String(t.scheduled_at).replace("T", " ").slice(0, 16)}</span>
-                  <span className="lb-sub-sm">{t.leads_count || ""}</span>
+                  <span className="lb-mono">🕒 {new Date(t.scheduled_at).toLocaleString()}</span>
+                  <span className="lb-sub-sm">{t.leads_count} leads</span>
                   <button className="lb-xbtn" data-testid={`cancel-sched-${t.id}`} onClick={() => cancelScheduled(t.id)}>cancel</button>
                 </div>
               ))}

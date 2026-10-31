@@ -16,6 +16,7 @@ from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
 import httpx
+from pymongo import ReturnDocument
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -473,11 +474,20 @@ async def _fail_task(task_id, msg):
     })
 
 async def execute_task(task_id: str):
-    doc = await db.tasks.find_one({"id": task_id}, {"_id": 0})
-    if not doc or doc["status"] not in ("scheduled", "pending"):
+    base = await db.tasks.find_one({"id": task_id}, {"_id": 0, "user_id": 1, "status": 1})
+    if not base or base["status"] not in ("scheduled", "pending"):
         return
-    if await db.tasks.find_one({"user_id": doc["user_id"], "status": "running"}):
+    if await db.tasks.find_one({"user_id": base["user_id"], "status": "running"}):
         return  # another task running; scheduler retries next cycle
+    # atomic claim so an immediate start and the scheduler can't double-run
+    doc = await db.tasks.find_one_and_update(
+        {"id": task_id, "status": {"$in": ["scheduled", "pending"]}},
+        {"$set": {"status": "claimed", "updated_at": now_iso()}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not doc:
+        return
+    doc.pop("_id", None)
     fbs = await db.firebases.find({"user_id": doc["user_id"]}, {"_id": 0}).to_list(200)
     if not fbs:
         return await _fail_task(task_id, "Koi Firebase add nahi hai")
@@ -510,16 +520,17 @@ async def start_task(body: TaskIn, user: dict = Depends(require_client)):
                 dt = dt.replace(tzinfo=timezone.utc)
         except Exception:
             raise HTTPException(status_code=400, detail="Galat schedule time")
-        if dt > datetime.now(timezone.utc) + timedelta(seconds=30):
-            sched_iso = dt.astimezone(timezone.utc).isoformat()
+        if dt <= datetime.now(timezone.utc) + timedelta(seconds=30):
+            raise HTTPException(status_code=400, detail="Schedule time abhi se aage (future) hona chahiye")
+        sched_iso = dt.astimezone(timezone.utc).isoformat()
 
     cfgd = {"sim": body.sim, "cap": body.cap, "distribute": body.distribute, "speed": body.speed,
             "delayMs": body.delayMs, "maxParallel": body.maxParallel, "autoLogout": body.autoLogout}
     task_id = str(uuid.uuid4())
     doc = {"id": task_id, "user_id": user["id"], "status": "scheduled" if sched_iso else "pending",
-           "scheduled_at": sched_iso, "leads": leads, "template": body.template, "config": cfgd,
-           "deviceKeys": body.deviceKeys, "total": 0, "sent": 0, "failed": 0, "done": 0, "devices": 0,
-           "log": [], "created_at": now_iso(), "updated_at": now_iso(), "finished_at": None}
+           "scheduled_at": sched_iso, "leads": leads, "leads_count": len(leads), "template": body.template,
+           "config": cfgd, "deviceKeys": body.deviceKeys, "total": 0, "sent": 0, "failed": 0, "done": 0,
+           "devices": 0, "log": [], "created_at": now_iso(), "updated_at": now_iso(), "finished_at": None}
 
     if not sched_iso and await db.tasks.find_one({"user_id": user["id"], "status": "running"}):
         raise HTTPException(status_code=409, detail="Ek task pehle se chal raha hai")
@@ -540,7 +551,11 @@ def _merge_live(doc):
 async def current_task(user: dict = Depends(require_client)):
     doc = await db.tasks.find_one({"user_id": user["id"], "status": "running"}, {"_id": 0, "leads": 0})
     if not doc:
-        doc = await db.tasks.find_one({"user_id": user["id"]}, {"_id": 0, "leads": 0}, sort=[("created_at", -1)])
+        # most recent task that actually ran (ignore scheduled + cancelled-before-run)
+        doc = await db.tasks.find_one(
+            {"user_id": user["id"], "status": {"$nin": ["scheduled", "cancelled", "claimed"]}},
+            {"_id": 0, "leads": 0}, sort=[("created_at", -1)],
+        )
     if not doc:
         return {"task": None}
     return {"task": _merge_live(doc)}
@@ -557,9 +572,13 @@ async def stop_task(task_id: str, user: dict = Depends(require_client)):
         raise HTTPException(status_code=404, detail="Task not found")
     st = RUNNING.get(task_id)
     if st:
-        st["stop"] = True
-    else:
+        st["stop"] = True  # running -> run_task sets status 'stopped'
+    elif doc["status"] in ("scheduled", "pending"):
+        await db.tasks.update_one({"id": task_id}, {"$set": {"status": "cancelled", "finished_at": now_iso(), "updated_at": now_iso()}})
+    elif doc["status"] == "running":
         await db.tasks.update_one({"id": task_id}, {"$set": {"status": "stopped", "finished_at": now_iso()}})
+    else:
+        raise HTTPException(status_code=400, detail="Task already finished")
     return {"ok": True}
 
 # mark interrupted tasks (server restart) as stopped

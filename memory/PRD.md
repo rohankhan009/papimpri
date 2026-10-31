@@ -62,3 +62,11 @@ online-device filter, and "one device sends 80 SMS" (configurable cap).
 - 401 interceptor -> clearAuth + back to Login.
 - Tested: backend 16/16 pytest; frontend 100% incl. logout-at-87% -> re-login shows running task -> completes -> auto-logout clears firebases. test_credentials.md updated.
 - Known low-pri backlog: brute-force/rate-limit on login, JWT revocation on password reset, restore task config in UI on re-login, SSRF hardening on firebase URL.
+
+## Update (2026-06) — Login lock, Scheduled blasts, Cyberpunk theme, Branding
+- LOGIN LOCKOUT: 5 wrong passwords -> account locked 15 min (failed_attempts/lock_until on user; 429 with message). Reset on success.
+- SCHEDULED BLASTS: TaskIn.scheduled_at; future -> status 'scheduled', stored with leads/config; server scheduler (15s loop) runs due tasks via execute_task (atomic claim via find_one_and_update to avoid double-run). Past/within-30s schedule -> 400. Cancel scheduled -> status 'cancelled'. /tasks/current excludes scheduled/cancelled/claimed. stop_task guarded (only scheduled/pending/running). Client UI: schedule toggle + datetime-local, scheduled-list with cancel, polls every 5s while scheduled, local-time display, leads_count.
+- THEME: full cyberpunk redesign (neon cyan #00f0ff + magenta #ff2bd6 + lime, animated grid bg, scanlines, neon card/button glow, title flicker). Global ClickFX (pointer-events:none particle 'boom' burst on every click). All text verified readable at 1920 & 390.
+- BRANDING EDITABLE: GET /api/settings (public) + PUT /api/settings (admin only). Admin dashboard 'Branding' card edits brand_name/short_name/tagline/footer_text. Default footer 'Made by @papiatma'. Headers + footer use it live.
+- Emergent branding removed from index.html (title, meta description, emergent-main.js floating badge).
+- Tested: backend 26/26 pytest; frontend new features pass; post-fix curl verified schedule/cancel/stop/current edge cases.
