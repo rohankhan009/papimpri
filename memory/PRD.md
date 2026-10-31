@@ -35,3 +35,10 @@ online-device filter, and "one device sends 80 SMS" (configurable cap).
 - Save/resume campaigns, retry failed, export send report CSV.
 - Live device online status auto-refresh (polling).
 - Rotate SIM per send; random-OTP generator (like panel's Nuke mode).
+
+## Update (2026-06) — {{v}} replace-file upload
+- Message Body me ek "Upload replace file" button add hua (.txt/.csv).
+- File ki har line = us position ke lead ka {{v}} value (line 1 → lead 1, line 2 → lead 2…).
+- Number leads upload/paste se aate hain; replace lines positional map hoti hain (invalid numbers filter hone ke baad bhi order sahi).
+- Mismatch count par warning. Auto-reconnect (localStorage) add hua; Disconnect clears it.
+- Verified via Node test: positional mapping PASS.

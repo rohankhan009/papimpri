@@ -16,13 +16,31 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [fbUrl, setFbUrl] = useState("");
   const [fbKey, setFbKey] = useState("");
+  const [booting, setBooting] = useState(true);
 
   useEffect(() => {
     const u = localStorage.getItem(LS_URL);
-    const k = localStorage.getItem(LS_KEY);
-    if (u) setFbUrl(u);
-    if (k) setFbKey(k);
+    const k = localStorage.getItem(LS_KEY) || "";
+    if (u) {
+      setFbUrl(u);
+      setFbKey(k);
+      // silent auto-reconnect
+      fbGet(normalizeUrl(u), k, "clients")
+        .then(() => setConnected(true))
+        .catch(() => {})
+        .finally(() => setBooting(false));
+    } else {
+      setBooting(false);
+    }
   }, []);
+
+  if (booting) {
+    return (
+      <div className="lb-setup" data-testid="booting">
+        <div className="lb-muted" style={{ fontSize: 14 }}>Connecting…</div>
+      </div>
+    );
+  }
 
   if (!connected) {
     return (
@@ -41,7 +59,17 @@ function App() {
       />
     );
   }
-  return <Panel base={fbUrl} fbKey={fbKey} onDisconnect={() => setConnected(false)} />;
+  return (
+    <Panel
+      base={fbUrl}
+      fbKey={fbKey}
+      onDisconnect={() => {
+        localStorage.removeItem(LS_URL);
+        localStorage.removeItem(LS_KEY);
+        setConnected(false);
+      }}
+    />
+  );
 }
 
 /* ───────────────────────── SETUP ───────────────────────── */
@@ -123,6 +151,9 @@ function Panel({ base, fbKey, onDisconnect }) {
   const [pasteText, setPasteText] = useState("");
   const [leadMode, setLeadMode] = useState("upload"); // upload | paste
   const [leadErr, setLeadErr] = useState("");
+  // per-line replacement values for {{v}} (uploaded separately, positional match)
+  const [replaceLines, setReplaceLines] = useState([]);
+  const [replaceName, setReplaceName] = useState("");
 
   // message
   const [template, setTemplate] = useState("");
@@ -165,13 +196,18 @@ function Panel({ base, fbKey, onDisconnect }) {
 
   const leads = useMemo(() => {
     const rows = leadData.rows || [];
-    return rows
+    const mapped = rows
       .map((r) => ({
         to: digits(r[numberCol]),
-        variable: varCol ? String(r[varCol] ?? "") : "",
+        v: varCol ? String(r[varCol] ?? "") : "",
       }))
       .filter((l) => l.to && l.to.replace(/\D/g, "").length >= 6);
-  }, [leadData, numberCol, varCol]);
+    // If a replace-lines file is uploaded, override the variable positionally (line N -> lead N)
+    if (replaceLines.length > 0) {
+      return mapped.map((l, i) => ({ to: l.to, variable: replaceLines[i] ?? "" }));
+    }
+    return mapped.map((l) => ({ to: l.to, variable: l.v }));
+  }, [leadData, numberCol, varCol, replaceLines]);
 
   const toggleDevice = (id) => {
     setSelectedIds((prev) => {
@@ -225,6 +261,24 @@ function Panel({ base, fbKey, onDisconnect }) {
     setLeadData(data);
     setNumberCol("number");
     setVarCol(data.rows.some((r) => r.variable) ? "variable" : "");
+  };
+
+  // Upload a file whose each line is the {{v}} value for the matching lead (line 1 -> lead 1, ...)
+  const onReplaceFile = async (file) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      let lines = text.split(/\r?\n/);
+      while (lines.length && lines[lines.length - 1].trim() === "") lines.pop();
+      setReplaceLines(lines);
+      setReplaceName(file.name);
+    } catch (e) {
+      setLeadErr("Replace file parse nahi hui: " + e.message);
+    }
+  };
+  const clearReplace = () => {
+    setReplaceLines([]);
+    setReplaceName("");
   };
 
   /* ── BLAST ENGINE ── */
@@ -525,6 +579,44 @@ function Panel({ base, fbKey, onDisconnect }) {
             Puri body sabko same jati hai. Jo <b>ek line har lead me badalni</b> ho, wahan{" "}
             <code>{"{{v}}"}</code> likhein — har lead ki variable value wahan lag jayegi.
           </p>
+
+          <div className="lb-replace" data-testid="replace-box">
+            <div className="lb-replace-top">
+              <span className="lb-fl" style={{ marginBottom: 0 }}>
+                <code>{"{{v}}"}</code> values — line by line (optional)
+              </span>
+              {replaceLines.length > 0 && (
+                <button className="lb-xbtn" data-testid="clear-replace" onClick={clearReplace}>
+                  ✕ clear
+                </button>
+              )}
+            </div>
+            <label className="lb-replace-upload" data-testid="replace-dropzone">
+              <input
+                type="file"
+                accept=".txt,.csv"
+                hidden
+                data-testid="replace-input"
+                onChange={(e) => onReplaceFile(e.target.files?.[0])}
+              />
+              <span>⬆ Upload replace file</span>
+              <small>Har line ek lead ke liye — line 1 → lead 1, line 2 → lead 2…</small>
+            </label>
+            {replaceLines.length > 0 && (
+              <div
+                className={`lb-replace-info ${
+                  leads.length && replaceLines.length !== leads.length ? "warn" : ""
+                }`}
+                data-testid="replace-info"
+              >
+                {replaceName}: <b>{replaceLines.length}</b> lines
+                {leads.length > 0 && replaceLines.length !== leads.length && (
+                  <> ⚠ leads {leads.length} se match nahi — extra khali rahenge</>
+                )}
+              </div>
+            )}
+          </div>
+
           <textarea
             className="lb-area lb-area-lg"
             data-testid="message-input"
