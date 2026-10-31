@@ -204,67 +204,71 @@ async def run_task(task_id: str, user_id: str, cfg: dict, groups: list, conn_map
     pool = cfg.get("maxParallel") or len(groups)
     pool = min(pool, len(groups)) or 1
     sem = asyncio.Semaphore(pool)
+    status = "completed"
 
-    async with httpx.AsyncClient() as http:
-        async def send_one(dev, lead):
-            msg = cfg["template"].replace("{{v}}", lead.get("variable", "") or "") if "{{v}}" in cfg["template"] else cfg["template"]
-            conn = conn_map[dev["connId"]]
-            payload = {"from": int(cfg.get("sim", 1)) or 1, "to": lead["to"], "message": msg, "isSended": False}
-            await fb_put(http, conn["url"], conn["key"], f"clients/{dev['id']}/webhookEvent/sendSms", payload)
-            if safe:
-                deadline = time.time() + 15
-                while time.time() < deadline:
-                    await asyncio.sleep(0.7)
-                    try:
-                        node = await fb_get(http, conn["url"], conn["key"], f"clients/{dev['id']}/webhookEvent/sendSms")
-                        if not node or node.get("isSended") in (True, "true"):
-                            return True
-                    except Exception:
-                        pass
-                return False
-            elif delay:
-                await asyncio.sleep(delay)
-            return True
+    try:
+        async with httpx.AsyncClient() as http:
+            async def send_one(dev, lead):
+                msg = cfg["template"].replace("{{v}}", lead.get("variable", "") or "") if "{{v}}" in cfg["template"] else cfg["template"]
+                conn = conn_map[dev["connId"]]
+                payload = {"from": int(cfg.get("sim", 1)) or 1, "to": lead["to"], "message": msg, "isSended": False}
+                await fb_put(http, conn["url"], conn["key"], f"clients/{dev['id']}/webhookEvent/sendSms", payload)
+                if safe:
+                    deadline = time.time() + 15
+                    while time.time() < deadline:
+                        await asyncio.sleep(0.7)
+                        try:
+                            node = await fb_get(http, conn["url"], conn["key"], f"clients/{dev['id']}/webhookEvent/sendSms")
+                            if not node or node.get("isSended") in (True, "true"):
+                                return True
+                        except Exception:
+                            pass
+                    return False
+                elif delay:
+                    await asyncio.sleep(delay)
+                return True
 
-        async def run_device(group):
-            async with sem:
-                dev = group["device"]
-                for lead in group["leads"]:
-                    if st["stop"]:
-                        return
-                    try:
-                        ok = await send_one(dev, lead)
-                        if ok:
-                            st["sent"] += 1
-                            st["log"].appendleft({"type": "ok", "text": f"✓ {dev['name']} → {lead['to']}", "t": now_iso()})
-                        else:
+            async def run_device(group):
+                async with sem:
+                    dev = group["device"]
+                    for lead in group["leads"]:
+                        if st["stop"]:
+                            return
+                        try:
+                            ok = await send_one(dev, lead)
+                            if ok:
+                                st["sent"] += 1
+                                st["log"].appendleft({"type": "ok", "text": f"✓ {dev['name']} → {lead['to']}", "t": now_iso()})
+                            else:
+                                st["failed"] += 1
+                                st["log"].appendleft({"type": "err", "text": f"⌛ {dev['name']} → {lead['to']} (timeout)", "t": now_iso()})
+                        except Exception as e:
                             st["failed"] += 1
-                            st["log"].appendleft({"type": "err", "text": f"⌛ {dev['name']} → {lead['to']} (timeout)", "t": now_iso()})
-                    except Exception as e:
-                        st["failed"] += 1
-                        st["log"].appendleft({"type": "err", "text": f"✗ {dev['name']} → {lead['to']} ({str(e)[:60]})", "t": now_iso()})
-                    st["done"] += 1
+                            st["log"].appendleft({"type": "err", "text": f"✗ {dev['name']} → {lead['to']} ({str(e)[:60]})", "t": now_iso()})
+                        st["done"] += 1
 
-        await asyncio.gather(*[run_device(g) for g in groups])
+            await asyncio.gather(*[run_device(g) for g in groups])
+        if st["stop"]:
+            status = "stopped"
+    except Exception as e:
+        status = "failed"
+        logger.exception("run_task crashed: %s", e)
+        st["log"].appendleft({"type": "err", "text": f"Task error: {str(e)[:80]}", "t": now_iso()})
+    finally:
+        st["finished"] = True
+        st["log"].appendleft({"type": "info", "text": {"stopped": "⏹ Roka gaya.", "failed": "⚠ Task fail hua."}.get(status, "✅ Blast complete."), "t": now_iso()})
+        await db.tasks.update_one({"id": task_id}, {"$set": {
+            "status": status, "sent": st["sent"], "failed": st["failed"], "done": st["done"],
+            "log": list(st["log"]), "finished_at": now_iso(), "updated_at": now_iso(),
+        }})
+        if cfg.get("autoLogout") and status == "completed":
+            await db.firebases.delete_many({"user_id": user_id})
+            await db.tasks.update_one({"id": task_id}, {"$set": {"auto_logged_out": True}})
 
-    stopped = st["stop"]
-    st["finished"] = True
-    status = "stopped" if stopped else "completed"
-    st["log"].appendleft({"type": "info", "text": "⏹ Roka gaya." if stopped else "✅ Blast complete.", "t": now_iso()})
-    await db.tasks.update_one({"id": task_id}, {"$set": {
-        "status": status, "sent": st["sent"], "failed": st["failed"], "done": st["done"],
-        "log": list(st["log"]), "finished_at": now_iso(), "updated_at": now_iso(),
-    }})
-
-    # auto logout all firebases on completion (not on manual stop)
-    if cfg.get("autoLogout") and not stopped:
-        await db.firebases.delete_many({"user_id": user_id})
-        await db.tasks.update_one({"id": task_id}, {"$set": {"auto_logged_out": True}})
-
-    async def cleanup():
-        await asyncio.sleep(10)
-        RUNNING.pop(task_id, None)
-    asyncio.create_task(cleanup())
+        async def cleanup():
+            await asyncio.sleep(10)
+            RUNNING.pop(task_id, None)
+        asyncio.create_task(cleanup())
 
 # ───────────────────────── routes: setup + auth ─────────────────────────
 @api_router.get("/")
@@ -331,6 +335,12 @@ async def reset_password(client_id: str, body: PasswordIn, admin: dict = Depends
 
 @api_router.delete("/admin/clients/{client_id}")
 async def delete_client(client_id: str, admin: dict = Depends(require_admin)):
+    # stop any running background task for this client
+    running = await db.tasks.find({"user_id": client_id, "status": "running"}, {"_id": 0, "id": 1}).to_list(50)
+    for t in running:
+        st = RUNNING.get(t["id"])
+        if st:
+            st["stop"] = True
     await db.users.delete_one({"id": client_id, "role": "client"})
     await db.firebases.delete_many({"user_id": client_id})
     await db.tasks.delete_many({"user_id": client_id})
@@ -339,13 +349,18 @@ async def delete_client(client_id: str, admin: dict = Depends(require_admin)):
 # ───────────────────────── routes: firebases (client) ─────────────────────────
 @api_router.get("/firebases")
 async def list_firebases(user: dict = Depends(require_client)):
-    return await db.firebases.find({"user_id": user["id"]}, {"_id": 0}).to_list(200)
+    fbs = await db.firebases.find({"user_id": user["id"]}, {"_id": 0, "key": 0}).to_list(200)
+    for f in fbs:
+        f["has_key"] = True  # key stored server-side, not exposed
+    return fbs
 
 @api_router.post("/firebases")
 async def add_firebase(body: FirebaseIn, user: dict = Depends(require_client)):
     base = body.url.strip().rstrip("/")
     if not base.startswith("http"):
         base = "https://" + base
+    if await db.firebases.find_one({"user_id": user["id"], "url": base}):
+        raise HTTPException(status_code=409, detail="Ye Firebase pehle se add hai")
     # validate connection
     try:
         async with httpx.AsyncClient() as http:
@@ -355,7 +370,7 @@ async def add_firebase(body: FirebaseIn, user: dict = Depends(require_client)):
     fb = {"id": str(uuid.uuid4()), "user_id": user["id"], "label": body.label.strip() or "Firebase",
           "url": base, "key": body.key, "created_at": now_iso()}
     await db.firebases.insert_one(fb)
-    return {k: v for k, v in fb.items() if k != "_id"}
+    return {"id": fb["id"], "label": fb["label"], "url": fb["url"], "created_at": fb["created_at"], "has_key": bool(body.key)}
 
 @api_router.delete("/firebases/{fb_id}")
 async def delete_firebase(fb_id: str, user: dict = Depends(require_client)):

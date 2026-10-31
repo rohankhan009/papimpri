@@ -50,3 +50,15 @@ online-device filter, and "one device sends 80 SMS" (configurable cap).
 - Speed modes: Turbo (no ack, delay default 400ms) [default] vs Safe (wait isSended, poll 700ms/timeout 15s).
 - Spread mode default (round-robin across all devices) for max speed; "one device fully" still available.
 - Progress bar + live rate (/s) + elapsed. Logout all = clears all connections at once.
+
+## Update (2026-06) — Admin + Client auth, server-side background blast
+- MAJOR: moved to full-stack. Custom JWT + bcrypt auth (no Clerk; closed username/password system).
+- Roles: admin (manage clients only, cannot blast) + client (own firebases/leads/tasks, isolated).
+- First-run: /api/setup/admin creates admin (username papiatma; password set on first screen).
+- Admin dashboard: create/list/reset-password/delete clients. Deleting a client stops its running task.
+- Client panel now talks to API: firebases add/remove/remove-all (dup URL rejected 409, key never returned to client), /devices (server merges+filters online), leads+{{v}} replace file (client-side parse), start/stop task.
+- BACKGROUND ENGINE (server-side): POST /api/tasks runs asyncio task; parallel across devices; progress persisted to Mongo via _flusher; survives client logout. GET /api/tasks/current resumes % on re-login. run_task wrapped try/except/finally (crash -> status=failed, frees 409 lock). Startup marks interrupted running tasks.
+- Auto-logout-all-firebase default ON: on completed task, all client firebases removed.
+- 401 interceptor -> clearAuth + back to Login.
+- Tested: backend 16/16 pytest; frontend 100% incl. logout-at-87% -> re-login shows running task -> completes -> auto-logout clears firebases. test_credentials.md updated.
+- Known low-pri backlog: brute-force/rate-limit on login, JWT revocation on password reset, restore task config in UI on re-login, SSRF hardening on firebase URL.

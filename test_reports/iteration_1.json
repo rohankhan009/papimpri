@@ -1,0 +1,47 @@
+{
+  "summary": "Full backend (16 pytest tests, all pass) + frontend E2E (Playwright, real login flows) of SMS Lead Blaster with server-side auth/background tasks, using mock Firebase on 127.0.0.1:9999. Verified: setup status -> Login screen (no Create Admin), admin login, client create/duplicate(409)/short pw(400)/reset pw (old rejected, new works)/delete, admin 403 on /firebases & /tasks, client 403 on /admin/clients, client login + refresh persists session, logout, add Firebase (bad URL shows error), multiple Firebases + Remove all + single remove, online filter (Galaxy-A05, Vivo-Y17 shown; Redmi-12 excluded), paste leads + {{v}} replace-file positional mapping (preview 'Hi R1 code 4821'), turbo blast 4/4 -> completed 100% (mock received 4 PUTs), auto-logout removes all Firebases, safe-mode 30 lead blast -> logout -> re-login shows running task at 87% with Stop button, then completes 30/30 and auto-logout clears fb-list; autoLogout=false keeps Firebases; manual stop -> status stopped and no auto-logout; second start -> 409; cap+distribute=one totals correct; per-client isolation of firebases/devices/tasks/stop.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/firebases", "issue": "Same Firebase URL can be added multiple times; devices are then listed twice (UI showed '4 online' for 2 physical phones) and a blast creates 2 queues writing to the SAME clients/{id}/webhookEvent/sendSms node concurrently -> in turbo mode PUTs overwrite each other and SMS can be silently lost while counted as sent. Dedupe by url per user (409) or dedupe device keys by url+deviceId."},
+      {"endpoint": "run_task (background engine)", "issue": "No try/except around the whole engine (only per-lead). Any unexpected exception (e.g. httpx client error, KeyError) leaves task status='running' forever and _flusher loops forever; client is then blocked by 409 until a backend restart. Wrap in try/finally that sets finished=True and status='failed'."},
+      {"endpoint": "DELETE /api/admin/clients/{id}", "issue": "Deleting a client with a running task does not set RUNNING[task]['stop']=True; the background task keeps sending SMS after the client is deleted."},
+      {"endpoint": "POST /api/firebases / GET /api/firebases", "issue": "Security: arbitrary URLs accepted (SSRF to internal hosts possible) and Firebase auth key returned in plaintext to frontend in GET /api/firebases. Consider masking key in responses."},
+      {"endpoint": "template substitution", "issue": "Placeholder is literally '{{v}}' (backend `\"{{v}}\"` non-f-string, frontend same). Review request mentioned 'Hi {v} code 4821' — single-brace {v} is NOT substituted (sent verbatim). Confirm intended token with user or support both."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "ClientPanel send card", "issue": "After re-login during a running task, the Turbo/Safe badge and config inputs show defaults (TURBO) instead of the running task's config (task.config.speed=safe).", "selector": "[data-testid='mode-turbo']", "priority": "LOW"}
+    ],
+    "integration_issues": [
+      {"flow": "Auth/session", "issue": "api.js has no 401 response interceptor; an expired/invalid token mid-session (or deleted client) leaves the panel visible with silently failing calls instead of returning to Login.", "affected_selectors": ["[data-testid='client-panel']", "[data-testid='admin-dashboard']"]},
+      {"flow": "Error handling", "issue": "removeFirebase, removeAllFirebases, stopBlast (ClientPanel) and doReset/remove (AdminDashboard) have no try/catch or error display; failures are unhandled promise rejections with no user feedback. Reset modal also gives no message for <4 char password.", "affected_selectors": ["[data-testid='remove-all-fb']", "[data-testid='stop-blast']", "[data-testid='reset-password-submit']"]}
+    ],
+    "design_issues": [
+      {"screen": "Client panel after auto-logout", "issues": ["No explicit notice that Firebases were auto-removed after completion (only fb-list disappears; task has auto_logged_out flag that could be shown)."]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_leadblast_api.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "Prevent duplicate Firebase URLs per client (or dedupe devices) to avoid concurrent overwrites of the same sendSms node",
+    "Wrap run_task in try/except/finally so crashes mark task failed and free the 409 lock",
+    "Stop running task when admin deletes a client",
+    "Add 401 axios interceptor -> clearAuth + back to Login",
+    "Add error handling/feedback for remove/stop/reset actions",
+    "Clarify placeholder token ({{v}} vs {v})",
+    "Optionally mask Firebase key in GET /api/firebases; restore task config in UI on re-login"
+  ],
+  "critical_code_review_comments": [
+    "RUNNING registry is in-process memory: fine for single uvicorn worker; multiple workers would break live progress/stop.",
+    "No brute-force/rate limiting on /api/auth/login; JWT valid 7 days with no revocation (password reset does not invalidate existing tokens).",
+    "list_clients does N+1 queries (count + find per client) — fine at small scale."
+  ],
+  "updated_files": ["/app/backend/tests/test_leadblast_api.py"],
+  "success_rate": {"backend": "100% (16/16)", "frontend": "100% of requested flows passed"},
+  "test_credentials": "From /app/memory/test_credentials.md: admin papiatma/Freefire12@, client raju/raju123. Created via UI: qa_client_1 (password reset to qa_pass_new) — left in DB.",
+  "seed_data_creation": "qa_client_1 / qa_pass_new client left in DB. pytest TEST_c_* clients are cleaned up automatically. raju has task history from tests; raju has 0 Firebases (auto-logged out).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Start mock: python /app/tests/mockfb.py & (POST http://127.0.0.1:9999/__count returns number of sendSms PUTs). Run: export REACT_APP_BACKEND_URL from frontend/.env; pytest /app/backend/tests/test_leadblast_api.py. Safe mode with mock takes ~0.7s/lead/device, useful for keeping a task running (30 leads ~11s). window.confirm used for Remove all / delete client — accept dialogs in Playwright. Placeholder token is {{v}}."
+}
