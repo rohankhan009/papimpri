@@ -26,6 +26,15 @@ db = client[os.environ['DB_NAME']]
 
 JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALGO = "HS256"
+MAX_FAILED = 5
+LOCK_MINUTES = 15
+
+DEFAULT_SETTINGS = {
+    "brand_name": "SMS Lead Blaster",
+    "short_name": "Lead Blast",
+    "tagline": "Apne devices se leads ko line-by-line SMS bhejein.",
+    "footer_text": "Made by @papiatma",
+}
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -113,6 +122,7 @@ class TaskIn(BaseModel):
     maxParallel: int = 0          # 0 = all
     deviceKeys: Optional[List[str]] = None  # None = all online
     autoLogout: bool = True
+    scheduled_at: Optional[str] = None  # ISO time; if future -> scheduled
 
 # ───────────────────────── firebase (server-side) ─────────────────────────
 def fb_url(base: str, key: str, path: str) -> str:
@@ -294,9 +304,50 @@ async def setup_admin(body: AdminSetupIn):
 @api_router.post("/auth/login")
 async def login(body: LoginIn):
     user = await db.users.find_one({"username": body.username.strip()})
-    if not user or not verify_pw(body.password, user["password_hash"]):
+    if not user:
         raise HTTPException(status_code=401, detail="Galat username ya password")
+    lock_until = user.get("lock_until")
+    if lock_until:
+        try:
+            lu = datetime.fromisoformat(lock_until)
+        except Exception:
+            lu = None
+        if lu and lu > datetime.now(timezone.utc):
+            mins = int((lu - datetime.now(timezone.utc)).total_seconds() // 60) + 1
+            raise HTTPException(status_code=429, detail=f"Account locked. {mins} min baad try karein")
+    if not verify_pw(body.password, user["password_hash"]):
+        attempts = user.get("failed_attempts", 0) + 1
+        if attempts >= MAX_FAILED:
+            lock = (datetime.now(timezone.utc) + timedelta(minutes=LOCK_MINUTES)).isoformat()
+            await db.users.update_one({"id": user["id"]}, {"$set": {"failed_attempts": 0, "lock_until": lock}})
+            raise HTTPException(status_code=429, detail=f"Galat password {MAX_FAILED} baar — account {LOCK_MINUTES} min ke liye locked")
+        await db.users.update_one({"id": user["id"]}, {"$set": {"failed_attempts": attempts}})
+        raise HTTPException(status_code=401, detail=f"Galat password ({MAX_FAILED - attempts} try bache)")
+    await db.users.update_one({"id": user["id"]}, {"$set": {"failed_attempts": 0, "lock_until": None}})
     return {"token": make_token(user), "role": user["role"], "username": user["username"]}
+
+# ───────────────────────── routes: settings (branding) ─────────────────────────
+async def get_settings_doc():
+    s = await db.settings.find_one({"id": "global"}, {"_id": 0})
+    if not s:
+        s = {"id": "global", **DEFAULT_SETTINGS}
+        await db.settings.insert_one({**s})
+    return {k: s.get(k, DEFAULT_SETTINGS[k]) for k in DEFAULT_SETTINGS}
+
+@api_router.get("/settings")
+async def get_settings():
+    return await get_settings_doc()
+
+class SettingsIn(BaseModel):
+    brand_name: str
+    short_name: str
+    tagline: str
+    footer_text: str
+
+@api_router.put("/settings")
+async def put_settings(body: SettingsIn, admin: dict = Depends(require_admin)):
+    await db.settings.update_one({"id": "global"}, {"$set": body.model_dump()}, upsert=True)
+    return await get_settings_doc()
 
 @api_router.get("/me")
 async def me(user: dict = Depends(current_user)):
@@ -399,17 +450,8 @@ async def get_devices(user: dict = Depends(require_client)):
     return {"devices": all_devs, "errors": errs}
 
 # ───────────────────────── routes: tasks (client) ─────────────────────────
-@api_router.post("/tasks")
-async def start_task(body: TaskIn, user: dict = Depends(require_client)):
-    if await db.tasks.find_one({"user_id": user["id"], "status": "running"}):
-        raise HTTPException(status_code=409, detail="Ek task pehle se chal raha hai")
-
-    fbs = await db.firebases.find({"user_id": user["id"]}, {"_id": 0}).to_list(200)
-    if not fbs:
-        raise HTTPException(status_code=400, detail="Koi Firebase add nahi hai")
+async def _fetch_online_devices(fbs, device_keys):
     conn_map = {f["id"]: {"url": f["url"], "key": f["key"], "label": f["label"]} for f in fbs}
-
-    # fetch live devices
     async with httpx.AsyncClient() as http:
         results = await asyncio.gather(*[fb_get(http, f["url"], f["key"], "clients") for f in fbs], return_exceptions=True)
     devices = []
@@ -419,35 +461,74 @@ async def start_task(body: TaskIn, user: dict = Depends(require_client)):
         for d in parse_devices(res):
             if d["online"]:
                 devices.append({**d, "key": f["id"] + ":" + d["id"], "connId": f["id"], "connLabel": f["label"]})
-    if body.deviceKeys:
-        allow = set(body.deviceKeys)
+    if device_keys:
+        allow = set(device_keys)
         devices = [d for d in devices if d["key"] in allow]
-    if not devices:
-        raise HTTPException(status_code=400, detail="Koi online device nahi hai")
+    return devices, conn_map
 
+async def _fail_task(task_id, msg):
+    await db.tasks.update_one({"id": task_id}, {
+        "$set": {"status": "failed", "finished_at": now_iso(), "updated_at": now_iso()},
+        "$push": {"log": {"type": "err", "text": msg, "t": now_iso()}},
+    })
+
+async def execute_task(task_id: str):
+    doc = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    if not doc or doc["status"] not in ("scheduled", "pending"):
+        return
+    if await db.tasks.find_one({"user_id": doc["user_id"], "status": "running"}):
+        return  # another task running; scheduler retries next cycle
+    fbs = await db.firebases.find({"user_id": doc["user_id"]}, {"_id": 0}).to_list(200)
+    if not fbs:
+        return await _fail_task(task_id, "Koi Firebase add nahi hai")
+    devices, conn_map = await _fetch_online_devices(fbs, doc.get("deviceKeys"))
+    if not devices:
+        return await _fail_task(task_id, "Koi online device nahi hai")
+    cfgd = doc["config"]
+    groups = build_queues(devices, doc["leads"], cfgd.get("distribute", "spread"), cfgd.get("cap", 80))
+    total = sum(len(g["leads"]) for g in groups)
+    await db.tasks.update_one({"id": task_id}, {"$set": {"status": "running", "total": total, "devices": len(groups), "updated_at": now_iso()}})
+    RUNNING[task_id] = {"stop": False, "sent": 0, "failed": 0, "done": 0, "total": total, "log": deque(maxlen=120), "finished": False}
+    cfg_full = {**cfgd, "template": doc["template"]}
+    asyncio.create_task(run_task(task_id, doc["user_id"], cfg_full, groups, conn_map))
+
+@api_router.post("/tasks")
+async def start_task(body: TaskIn, user: dict = Depends(require_client)):
     leads = [{"to": l.to, "variable": l.variable} for l in body.leads if l.to]
     if not leads:
         raise HTTPException(status_code=400, detail="Koi valid lead nahi")
     if not body.template.strip():
         raise HTTPException(status_code=400, detail="Message body khali hai")
+    if await db.firebases.count_documents({"user_id": user["id"]}) == 0:
+        raise HTTPException(status_code=400, detail="Koi Firebase add nahi hai")
 
-    groups = build_queues(devices, leads, body.distribute, body.cap)
-    total = sum(len(g["leads"]) for g in groups)
+    sched_iso = None
+    if body.scheduled_at:
+        try:
+            dt = datetime.fromisoformat(body.scheduled_at.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Galat schedule time")
+        if dt > datetime.now(timezone.utc) + timedelta(seconds=30):
+            sched_iso = dt.astimezone(timezone.utc).isoformat()
 
-    cfg = {"template": body.template, "sim": body.sim, "speed": body.speed,
-           "delayMs": body.delayMs, "maxParallel": body.maxParallel, "autoLogout": body.autoLogout}
-
+    cfgd = {"sim": body.sim, "cap": body.cap, "distribute": body.distribute, "speed": body.speed,
+            "delayMs": body.delayMs, "maxParallel": body.maxParallel, "autoLogout": body.autoLogout}
     task_id = str(uuid.uuid4())
-    doc = {"id": task_id, "user_id": user["id"], "status": "running", "total": total,
-           "sent": 0, "failed": 0, "done": 0, "devices": len(groups), "log": [],
-           "config": {**cfg, "distribute": body.distribute, "cap": body.cap},
-           "created_at": now_iso(), "updated_at": now_iso(), "finished_at": None}
-    await db.tasks.insert_one({k: v for k, v in doc.items()})
+    doc = {"id": task_id, "user_id": user["id"], "status": "scheduled" if sched_iso else "pending",
+           "scheduled_at": sched_iso, "leads": leads, "template": body.template, "config": cfgd,
+           "deviceKeys": body.deviceKeys, "total": 0, "sent": 0, "failed": 0, "done": 0, "devices": 0,
+           "log": [], "created_at": now_iso(), "updated_at": now_iso(), "finished_at": None}
 
-    RUNNING[task_id] = {"stop": False, "sent": 0, "failed": 0, "done": 0, "total": total,
-                        "log": deque(maxlen=120), "finished": False}
-    asyncio.create_task(run_task(task_id, user["id"], cfg, groups, conn_map))
-    return {"task_id": task_id, "total": total, "devices": len(groups)}
+    if not sched_iso and await db.tasks.find_one({"user_id": user["id"], "status": "running"}):
+        raise HTTPException(status_code=409, detail="Ek task pehle se chal raha hai")
+    await db.tasks.insert_one({k: v for k, v in doc.items()})
+    if sched_iso:
+        return {"task_id": task_id, "scheduled": True, "scheduled_at": sched_iso}
+    await execute_task(task_id)
+    t = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    return {"task_id": task_id, "total": t.get("total", 0), "devices": t.get("devices", 0), "status": t.get("status")}
 
 def _merge_live(doc):
     st = RUNNING.get(doc["id"])
@@ -457,16 +538,16 @@ def _merge_live(doc):
 
 @api_router.get("/tasks/current")
 async def current_task(user: dict = Depends(require_client)):
-    doc = await db.tasks.find_one({"user_id": user["id"], "status": "running"}, {"_id": 0})
+    doc = await db.tasks.find_one({"user_id": user["id"], "status": "running"}, {"_id": 0, "leads": 0})
     if not doc:
-        doc = await db.tasks.find_one({"user_id": user["id"]}, {"_id": 0}, sort=[("created_at", -1)])
+        doc = await db.tasks.find_one({"user_id": user["id"]}, {"_id": 0, "leads": 0}, sort=[("created_at", -1)])
     if not doc:
         return {"task": None}
     return {"task": _merge_live(doc)}
 
 @api_router.get("/tasks")
 async def task_history(user: dict = Depends(require_client)):
-    docs = await db.tasks.find({"user_id": user["id"]}, {"_id": 0, "log": 0}).sort("created_at", -1).to_list(50)
+    docs = await db.tasks.find({"user_id": user["id"]}, {"_id": 0, "log": 0, "leads": 0}).sort("created_at", -1).to_list(50)
     return docs
 
 @api_router.post("/tasks/{task_id}/stop")
@@ -485,6 +566,28 @@ async def stop_task(task_id: str, user: dict = Depends(require_client)):
 @app.on_event("startup")
 async def mark_interrupted():
     await db.tasks.update_many({"status": "running"}, {"$set": {"status": "interrupted", "finished_at": now_iso()}})
+
+@app.on_event("startup")
+async def start_scheduler():
+    async def loop():
+        while True:
+            await asyncio.sleep(15)
+            try:
+                scheduled = await db.tasks.find({"status": "scheduled"}, {"_id": 0, "id": 1, "scheduled_at": 1}).to_list(100)
+                now = datetime.now(timezone.utc)
+                for t in scheduled:
+                    sa = t.get("scheduled_at")
+                    if not sa:
+                        continue
+                    try:
+                        due = datetime.fromisoformat(sa.replace("Z", "+00:00")) <= now
+                    except Exception:
+                        due = False
+                    if due:
+                        await execute_task(t["id"])
+            except Exception:
+                logger.exception("scheduler loop error")
+    asyncio.create_task(loop())
 
 app.include_router(api_router)
 app.add_middleware(

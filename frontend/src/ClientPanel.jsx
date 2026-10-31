@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import api, { savedUser } from "@/api";
 import { parseCsvFile, parseXlsxFile, parsePasted, digits } from "@/leads";
 
-export default function ClientPanel({ onLogout }) {
+export default function ClientPanel({ brand, onLogout }) {
   const [firebases, setFirebases] = useState([]);
   const [devicesData, setDevicesData] = useState({ devices: [], errors: [] });
   const [loadingDevs, setLoadingDevs] = useState(true);
@@ -40,6 +40,10 @@ export default function ClientPanel({ onLogout }) {
   const [task, setTask] = useState(null);
   const [startErr, setStartErr] = useState("");
   const prevStatus = useRef(null);
+  // scheduling
+  const [scheduleOn, setScheduleOn] = useState(false);
+  const [scheduleAt, setScheduleAt] = useState("");
+  const [scheduled, setScheduled] = useState([]);
 
   const loadFirebases = useCallback(async () => {
     try {
@@ -63,12 +67,19 @@ export default function ClientPanel({ onLogout }) {
       setTask(data.task);
     } catch {}
   }, []);
+  const loadScheduled = useCallback(async () => {
+    try {
+      const { data } = await api.get("/tasks");
+      setScheduled(data.filter((t) => t.status === "scheduled"));
+    } catch {}
+  }, []);
 
   useEffect(() => {
     loadFirebases();
     loadDevices();
     loadTask();
-  }, [loadFirebases, loadDevices, loadTask]);
+    loadScheduled();
+  }, [loadFirebases, loadDevices, loadTask, loadScheduled]);
 
   // poll while running
   useEffect(() => {
@@ -129,15 +140,19 @@ export default function ClientPanel({ onLogout }) {
     }
   };
   const removeFirebase = async (id) => {
-    await api.delete(`/firebases/${id}`);
-    await loadFirebases();
-    await loadDevices();
+    try {
+      await api.delete(`/firebases/${id}`);
+      await loadFirebases();
+      await loadDevices();
+    } catch (e) { alert(e.response?.data?.detail || "Remove fail"); }
   };
   const removeAllFirebases = async () => {
     if (!window.confirm("Sabhi Firebase connections remove kar dein?")) return;
-    await api.delete("/firebases");
-    await loadFirebases();
-    await loadDevices();
+    try {
+      await api.delete("/firebases");
+      await loadFirebases();
+      await loadDevices();
+    } catch (e) { alert(e.response?.data?.detail || "Remove fail"); }
   };
 
   /* leads ops */
@@ -173,27 +188,37 @@ export default function ClientPanel({ onLogout }) {
   /* task ops */
   const startBlast = async () => {
     setStartErr("");
+    const payload = {
+      leads, template, sim,
+      cap: Number(cap) || 1, distribute, speed,
+      delayMs: Number(delayMs) || 0, maxParallel: Number(maxParallel) || 0, autoLogout,
+      deviceKeys: deviceSel === "selected" ? [...selectedIds] : null,
+    };
+    if (scheduleOn && scheduleAt) payload.scheduled_at = new Date(scheduleAt).toISOString();
     try {
-      const { data } = await api.post("/tasks", {
-        leads,
-        template,
-        sim,
-        cap: Number(cap) || 1,
-        distribute,
-        speed,
-        delayMs: Number(delayMs) || 0,
-        maxParallel: Number(maxParallel) || 0,
-        autoLogout,
-        deviceKeys: deviceSel === "selected" ? [...selectedIds] : null,
-      });
-      setTask({ id: data.task_id, status: "running", total: data.total, sent: 0, failed: 0, done: 0, devices: data.devices, log: [] });
+      const { data } = await api.post("/tasks", payload);
+      if (data.scheduled) {
+        setScheduleOn(false);
+        setScheduleAt("");
+        loadScheduled();
+      } else {
+        setTask({ id: data.task_id, status: "running", total: data.total, sent: 0, failed: 0, done: 0, devices: data.devices, log: [] });
+      }
     } catch (e) {
       setStartErr(e.response?.data?.detail || "Start fail");
     }
   };
   const stopBlast = async () => {
-    if (task?.id) await api.post(`/tasks/${task.id}/stop`);
-    loadTask();
+    try {
+      if (task?.id) await api.post(`/tasks/${task.id}/stop`);
+      loadTask();
+    } catch (e) { alert(e.response?.data?.detail || "Stop fail"); }
+  };
+  const cancelScheduled = async (id) => {
+    try {
+      await api.post(`/tasks/${id}/stop`);
+      loadScheduled();
+    } catch (e) { alert(e.response?.data?.detail || "Cancel fail"); }
   };
 
   const running = task?.status === "running";
@@ -205,7 +230,7 @@ export default function ClientPanel({ onLogout }) {
   return (
     <div className="lb-panel" data-testid="client-panel">
       <div className="lb-topbar">
-        <div className="lb-logo"><span className="lb-grad">Lead</span> Blast</div>
+        <div className="lb-logo"><span className="lb-grad">{brand.short_name}</span></div>
         <div className="lb-pills">
           <span className="lb-pill lb-pfb" data-testid="who">{savedUser()}</span>
           <span className="lb-pill lb-pt">{firebases.length} firebase</span>
@@ -374,6 +399,29 @@ export default function ClientPanel({ onLogout }) {
             Task complete hote hi sab Firebase auto-logout (remove)
           </label>
 
+          <div className="lb-sched">
+            <label className="lb-check" style={{ marginBottom: scheduleOn ? 10 : 0 }}>
+              <input type="checkbox" data-testid="schedule-toggle" checked={scheduleOn} onChange={(e) => setScheduleOn(e.target.checked)} />
+              🕒 Schedule for later (future time par apne aap chalega)
+            </label>
+            {scheduleOn && (
+              <input type="datetime-local" className="lb-input lb-sm" data-testid="schedule-at" value={scheduleAt} onChange={(e) => setScheduleAt(e.target.value)} />
+            )}
+          </div>
+
+          {scheduled.length > 0 && (
+            <div className="lb-schedlist" data-testid="scheduled-list">
+              <div className="lb-fl">Scheduled blasts</div>
+              {scheduled.map((t) => (
+                <div key={t.id} className="lb-schedrow" data-testid={`scheduled-${t.id}`}>
+                  <span className="lb-mono">🕒 {String(t.scheduled_at).replace("T", " ").slice(0, 16)}</span>
+                  <span className="lb-sub-sm">{t.leads_count || ""}</span>
+                  <button className="lb-xbtn" data-testid={`cancel-sched-${t.id}`} onClick={() => cancelScheduled(t.id)}>cancel</button>
+                </div>
+              ))}
+            </div>
+          )}
+
           {(running || total > 0) && (
             <div className="lb-progress-wrap" data-testid="progress">
               <div className="lb-progress-bar" style={{ width: pct + "%" }} />
@@ -387,7 +435,7 @@ export default function ClientPanel({ onLogout }) {
           </div>
 
           {!running ? (
-            <button className="lb-fire" data-testid="start-blast" onClick={startBlast}>💥 Start Blast</button>
+            <button className="lb-fire" data-testid="start-blast" onClick={startBlast}>{scheduleOn ? "🕒 Schedule Blast" : "💥 Start Blast"}</button>
           ) : (
             <button className="lb-stop" data-testid="stop-blast" onClick={stopBlast}>⏹ Stop</button>
           )}

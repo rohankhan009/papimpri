@@ -1,16 +1,33 @@
 import { useEffect, useState } from "react";
 import "@/App.css";
-import api, { setAuth, clearAuth, getToken, savedRole } from "@/api";
+import api, { setAuth, clearAuth, getToken } from "@/api";
 import AdminDashboard from "@/AdminDashboard";
 import ClientPanel from "@/ClientPanel";
+import ClickFX from "@/ClickFX";
+
+const DEFAULT_BRAND = {
+  brand_name: "SMS Lead Blaster",
+  short_name: "Lead Blast",
+  tagline: "Apne devices se leads ko line-by-line SMS bhejein.",
+  footer_text: "Made by @papiatma",
+};
 
 function App() {
   const [booting, setBooting] = useState(true);
   const [needsAdmin, setNeedsAdmin] = useState(false);
   const [role, setRole] = useState(null);
+  const [brand, setBrand] = useState(DEFAULT_BRAND);
+
+  const loadBrand = async () => {
+    try {
+      const { data } = await api.get("/settings");
+      setBrand(data);
+    } catch {}
+  };
 
   useEffect(() => {
     (async () => {
+      loadBrand();
       try {
         const { data } = await api.get("/setup/status");
         if (data.needs_admin) {
@@ -31,27 +48,39 @@ function App() {
     })();
   }, []);
 
-  const onAuthed = (r) => setRole(r);
   const logout = () => {
     clearAuth();
     setRole(null);
   };
 
+  let screen;
   if (booting) {
-    return (
-      <div className="lb-setup" data-testid="booting">
-        <div className="lb-muted" style={{ fontSize: 14 }}>Loading…</div>
-      </div>
-    );
+    screen = <div className="lb-setup" data-testid="booting"><div className="lb-muted" style={{ fontSize: 14 }}>Loading…</div></div>;
+  } else if (needsAdmin) {
+    screen = <AdminSetup brand={brand} onDone={(r) => { setNeedsAdmin(false); setRole(r); }} />;
+  } else if (!role) {
+    screen = <Login brand={brand} onAuthed={setRole} />;
+  } else if (role === "admin") {
+    screen = <AdminDashboard brand={brand} onBrandChange={loadBrand} onLogout={logout} />;
+  } else {
+    screen = <ClientPanel brand={brand} onLogout={logout} />;
   }
-  if (needsAdmin) return <AdminSetup onDone={(r) => { setNeedsAdmin(false); onAuthed(r); }} />;
-  if (!role) return <Login onAuthed={onAuthed} />;
-  if (role === "admin") return <AdminDashboard onLogout={logout} />;
-  return <ClientPanel onLogout={logout} />;
+
+  return (
+    <>
+      <div className="lb-bg-grid" />
+      <div className="lb-scanlines" />
+      <ClickFX />
+      {screen}
+      <footer className="lb-footer" data-testid="app-footer">
+        <span className="lb-footer-txt">{brand.footer_text}</span>
+      </footer>
+    </>
+  );
 }
 
 /* ───── Admin first-run setup ───── */
-function AdminSetup({ onDone }) {
+function AdminSetup({ brand, onDone }) {
   const [username, setUsername] = useState("papiatma");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -85,7 +114,7 @@ function AdminSetup({ onDone }) {
 }
 
 /* ───── Login ───── */
-function Login({ onAuthed }) {
+function Login({ brand, onAuthed }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -104,7 +133,7 @@ function Login({ onAuthed }) {
     }
   };
   return (
-    <AuthShell eyebrow="Lead Blast Panel" title={<><span className="lb-grad">SMS</span> Lead Blaster</>} sub="Login karein — admin ya client account se.">
+    <AuthShell eyebrow="Secure Access" title={<span className="lb-grad lb-glitch" data-text={brand.brand_name}>{brand.brand_name}</span>} sub={brand.tagline}>
       <label className="lb-fl">Username</label>
       <input className="lb-input" data-testid="login-username" value={username} onChange={(e) => setUsername(e.target.value)} onKeyDown={(e) => e.key === "Enter" && submit()} />
       <label className="lb-fl">Password</label>
